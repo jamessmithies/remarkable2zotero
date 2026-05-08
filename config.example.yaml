@@ -1,0 +1,12 @@
+remarkable:
+  host: "10.11.99.1"          # USB default; use WiFi IP if connecting wirelessly
+  user: "root"
+  password: ""                 # Settings > General > Help > Copyrights and licenses
+
+zotero:
+  api_key: ""                  # https://www.zotero.org/settings/keys
+  group_id: 0                  # Numeric ID from group URL: zotero.org/groups/<ID>/...
+
+sync:
+  local_cache_dir: "~/.cache/remarkable2zotero/"
+  match_strategy: "filename"   # "filename" or "title"
