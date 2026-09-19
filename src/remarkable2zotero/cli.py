@@ -59,6 +59,8 @@ def _setup_logging(verbose: bool) -> None:
     root = logging.getLogger("remarkable2zotero")
     root.setLevel(level)
     root.addHandler(handler)
+    # rmscene warns once per page about newer firmware data it skips; highlights are unaffected
+    logging.getLogger("rmscene").setLevel(logging.DEBUG if verbose else logging.ERROR)
 
 
 @click.group()
@@ -221,15 +223,19 @@ def sync(ctx, document, dry_run, no_interact, force_create):
 
             click.echo(f"  {len(highlights)} highlight(s) found")
 
-            if dry_run:
-                click.echo("  [dry-run] Would sync to Zotero")
-                continue
-
             # Find match in Zotero
             match = zotero_client.find_matching_item(zot, doc, strategy=match_strategy)
 
+            if dry_run:
+                if match:
+                    click.echo(f"  [dry-run] Would add note to '{match.parent_title}' "
+                               f"({match.parent_item_key})")
+                else:
+                    click.echo("  [dry-run] No match found in Zotero")
+                continue
+
             if match:
-                click.echo(f"  Found in Zotero: '{match.parent_title}' ({match.attachment_key})")
+                click.echo(f"  Found in Zotero: '{match.parent_title}' ({match.parent_item_key})")
                 zotero_client.create_highlights_note(
                     zot, match.parent_item_key, highlights, doc.visible_name
                 )

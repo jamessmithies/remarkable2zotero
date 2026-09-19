@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
 from pathlib import Path
 
 from pyzotero import zotero
@@ -25,47 +26,73 @@ def find_matching_item(
     document: RemarkableDocument,
     strategy: str = "filename",
 ) -> ZoteroMatch | None:
-    search_queries = _build_search_queries(document.visible_name)
+    author, title = _parse_name(document.visible_name)
+    stem = _strip_extension(document.visible_name)
 
-    for query in search_queries:
+    for query in _build_search_queries(author, title, stem):
         log.debug("Searching Zotero with q='%s'", query)
-        match = _search_and_match(zot, document, query)
+        match = _search_and_match(zot, document, author, title, query)
         if match:
             return match
 
     return None
 
 
-def _build_search_queries(visible_name: str) -> list[str]:
-    queries = []
-    parts = re.split(r"\s*-\s*", visible_name)
-    parts = [p.strip() for p in parts if p.strip()]
+_EXTENSION_RE = re.compile(r"\.(pdf|epub)$", re.IGNORECASE)
+_LEADING_ARTICLE_RE = re.compile(r"^(the|a|an) ")
+
+
+def _strip_extension(name: str) -> str:
+    return _EXTENSION_RE.sub("", name.strip())
+
+
+def _normalize(text: str) -> str:
+    """Lowercase, strip accents, brackets and punctuation, collapse whitespace."""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c)).lower()
+    text = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", text)
+    text = re.sub(r"[\W_]+", " ", text)
+    return " ".join(text.split())
+
+
+def _parse_name(visible_name: str) -> tuple[str | None, str]:
+    """Split 'Author - Year - Title' into (author, title). Author is None if absent."""
+    name = _strip_extension(visible_name)
+    parts = [p.strip() for p in re.split(r"\s+-\s+", name) if p.strip()]
     non_year_parts = [p for p in parts if not re.match(r"^\d{4}$", p)]
 
     if len(non_year_parts) >= 2:
-        title = non_year_parts[-1]
-        queries.append(title)
-        author = non_year_parts[0]
-        queries.append(f"{author} {title}")
+        return non_year_parts[0], " - ".join(non_year_parts[1:])
+    return None, name.replace("_", " ")
 
-    queries.append(visible_name)
 
-    if len(non_year_parts) >= 1 and non_year_parts[0] not in queries:
-        queries.append(non_year_parts[0])
-
-    return queries
+def _build_search_queries(author: str | None, title: str, stem: str) -> list[str]:
+    # Short queries survive truncated names and punctuation differences; accents are
+    # kept because Zotero's quick search does not fold them
+    words = re.sub(r"[\W_]+", " ", title).lower().split()
+    queries = [" ".join(words[:4])]
+    if author:
+        surname = re.sub(r"[\W_]+", " ", author).lower().split()[-1]
+        queries.append(f"{surname} {' '.join(words[:2])}")
+        queries.append(surname)
+    queries.append(stem)  # finds attachments by filename
+    return [q for i, q in enumerate(queries) if q and q not in queries[:i]]
 
 
 def _search_and_match(
-    zot: zotero.Zotero, document: RemarkableDocument, query: str
+    zot: zotero.Zotero,
+    document: RemarkableDocument,
+    author: str | None,
+    title: str,
+    query: str,
 ) -> ZoteroMatch | None:
     try:
-        items = zot.items(q=query, limit=25)
+        items = zot.items(q=query, limit=50)
     except zotero_errors.PyZoteroError as e:
         _handle_http_error(e)
         return None
 
-    doc_name = document.visible_name.lower().removesuffix(".pdf")
+    doc_stem = _strip_extension(document.visible_name).lower()
 
     for item in items:
         data = item.get("data", {})
@@ -74,18 +101,18 @@ def _search_and_match(
         if item_type in ("attachment", "note"):
             # Check if this attachment's filename matches
             filename = data.get("filename", "")
-            if filename and Path(filename).stem.lower() == doc_name:
+            if filename and _strip_extension(filename).lower() == doc_stem:
                 parent_key = data.get("parentItem", "")
                 if parent_key:
                     return _build_match(zot, parent_key, item)
-        else:
-            # Parent item — match by title
-            title = data.get("title", "")
-            if _titles_match(doc_name, title):
-                item_key = data.get("key", "")
+        elif item_type != "annotation":
+            # Parent item — match by title, and by author when the name has one
+            if _titles_match(title, data.get("title", "")) and _author_matches(
+                author, data.get("creators", [])
+            ):
                 return ZoteroMatch(
-                    parent_item_key=item_key,
-                    parent_title=title,
+                    parent_item_key=data.get("key", ""),
+                    parent_title=data.get("title", ""),
                     attachment_key="",
                     attachment_filename="",
                     collections=data.get("collections", []),
@@ -94,30 +121,31 @@ def _search_and_match(
     return None
 
 
-def _titles_match(doc_name: str, zotero_title: str) -> bool:
-    doc_lower = doc_name.lower()
-    title_lower = zotero_title.lower()
+def _titles_match(doc_title: str, zotero_title: str) -> bool:
+    """Equal after normalization, or one is a prefix of the other.
 
-    if doc_lower == title_lower:
+    Prefix matching covers names truncated by the reMarkable and Zotero titles
+    carrying a subtitle the filename omits.
+    """
+    a = _LEADING_ARTICLE_RE.sub("", _normalize(doc_title))
+    b = _LEADING_ARTICLE_RE.sub("", _normalize(zotero_title))
+    if not a or not b:
+        return False
+    if a == b:
         return True
-    if title_lower in doc_lower:
-        return True
-    if doc_lower in title_lower:
-        return True
+    shorter, longer = sorted((a, b), key=len)
+    return len(shorter) >= 8 and " " in shorter and longer.startswith(shorter)
 
-    parts = re.split(r"\s*-\s*", doc_lower)
-    non_year_parts = [p.strip() for p in parts if p.strip() and not re.match(r"^\d{4}$", p.strip())]
 
-    for part in non_year_parts:
-        part_normalized = re.sub(r"[^\w\s]", "", part).strip()
-        title_normalized = re.sub(r"[^\w\s]", "", title_lower).strip()
-        if part_normalized and (
-            part_normalized == title_normalized
-            or part_normalized in title_normalized
-            or title_normalized in part_normalized
-        ):
+def _author_matches(author: str | None, creators: list[dict]) -> bool:
+    if not author or not creators:
+        return True
+    author_words = set(_normalize(author).split())
+    for creator in creators:
+        last = creator.get("lastName") or creator.get("name", "")
+        last_words = _normalize(last).split()
+        if last_words and last_words[-1] in author_words:
             return True
-
     return False
 
 
