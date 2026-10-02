@@ -82,7 +82,8 @@ def _parse_document(
     if file_type not in ("pdf", "epub"):
         return None
 
-    page_uuids = content.get("cPages", {}).get("pages", [])
+    # Newer firmware uses cPages.pages; older formatVersion 1 files use a top-level "pages" list
+    page_uuids = content.get("cPages", {}).get("pages", []) or content.get("pages", [])
     if isinstance(page_uuids, list) and page_uuids and isinstance(page_uuids[0], dict):
         page_uuids = [p.get("id", "") for p in page_uuids]
 

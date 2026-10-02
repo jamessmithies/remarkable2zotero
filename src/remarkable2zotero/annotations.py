@@ -86,7 +86,8 @@ def _extract_rects(item) -> list[Rect]:
 
 def _extract_color(item) -> tuple[int, int, int, int]:
     color_rgba = getattr(item, "color_rgba", None)
-    if color_rgba and len(color_rgba) >= 4:
+    # Firmware often writes an opaque-black placeholder here; fall back to the pen color then
+    if color_rgba and len(color_rgba) >= 4 and any(color_rgba[:3]):
         return tuple(int(c) for c in color_rgba[:4])
 
     color = getattr(item, "color", None)
