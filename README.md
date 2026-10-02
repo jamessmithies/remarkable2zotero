@@ -65,6 +65,17 @@ make list                      # list annotated documents on the device
 make extract                   # extract locally annotated PDFs (no Zotero)
 ```
 
+### Repairing existing notes
+
+Notes created before line-break repair was added have glued words. `repair-notes` fixes them from Zotero alone, so it also covers documents you've since removed from the tablet:
+
+```bash
+.venv/bin/remarkable2zotero repair-notes --dry-run   # show what would change
+.venv/bin/remarkable2zotero repair-notes
+```
+
+It finds every "reMarkable Highlights" note in the group and matches each highlight against the tablet's copy of the document in the sync cache, which has the same page numbers. If there's no cached copy, it downloads the item's PDF (or epub) from Zotero and searches every page, since that copy may be paginated differently. Notes are updated in place: only the text inside each highlight block changes, so the note keeps its key and anything else in it, and a highlight you've reformatted in Zotero is left alone.
+
 Running `make sync` presents a numbered list of annotated documents and prompts you to select which to process (e.g. `1,3` or `2-4` or `a` for all).
 
 ## How matching works
@@ -77,7 +88,7 @@ Use `--force-create` to create new Zotero items for documents that don't have an
 
 The reMarkable stores highlights as `GlyphRange` objects in its `.rm` v6 annotation files. Each `GlyphRange` contains the highlighted text string, rectangle coordinates, and color. The tool extracts these using the `rmscene` library.
 
-The `GlyphRange` text has no separator at line breaks, so a highlight spanning lines glues words together ("computerscience"). Before writing the note, sync matches each highlight against the words on its page of the PDF (for epubs, against every page of the converted PDF), ignoring spaces and punctuation, and rebuilds the text from the whole run of page words between the first and last match. Words hyphenated across a line break are rejoined, and words the tablet dropped from the middle of a highlight are restored when the PDF has them. If a highlight can't be matched (fewer than 40% of its characters align with the page), the tablet's text is kept and a warning is logged. Both PDFs and epubs use the same annotation format.
+The `GlyphRange` text has no separator at line breaks, so a highlight spanning lines glues words together ("computerscience"). Before writing the note, sync matches each highlight against the words on its page of the PDF (for epubs, against every page of the converted PDF), ignoring spaces and punctuation, and adds a space wherever the PDF has a word break the highlight lacks. The tablet's own characters are never changed, so OCR errors in a PDF's text layer don't leak into the note; words hyphenated across a line break stay whole, and whole words the tablet dropped from the middle of a highlight are added back when the PDF has them. If a highlight can't be matched (fewer than 40% of its characters align with the page), the tablet's text is kept and a warning is logged. Both PDFs and epubs use the same annotation format.
 
 ## Configuration
 
@@ -94,7 +105,7 @@ Config values can also be set via environment variables:
 
 - **rmscene warnings.** "Some data has not been read" warnings from the rmscene library are harmless. They indicate that firmware 3.25.x writes some newer fields that rmscene 0.8.0 doesn't recognise, but highlight data is parsed correctly.
 - **Line-break concatenation.** The reMarkable strips whitespace at line breaks when storing highlighted text (e.g. "yethistoriography" instead of "yet historiography"). Sync repairs this from the PDF (see above), but highlights it can't match against the PDF keep the glued text.
-- **OCR'd PDFs.** On scanned PDFs the restored text is only as good as the PDF's text layer: OCR misreadings are carried over, and words missing from the text layer can't be restored.
+- **OCR'd PDFs.** On scanned PDFs, where the text layer is garbled, spaces can only be restored where the tablet's text and the PDF's text agree; and words missing from the text layer can't be restored.
 
 ## Development
 

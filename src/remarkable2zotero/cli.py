@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import logging
 import sys
 from pathlib import Path
@@ -284,3 +285,95 @@ def sync(ctx, document, dry_run, no_interact, force_create):
     finally:
         sftp.close()
         client.close()
+
+
+@main.command("repair-notes")
+@click.option("--dry-run", is_flag=True, help="Show what would change without updating Zotero")
+@click.pass_context
+def repair_notes(ctx, dry_run):
+    """Fix glued words in existing "reMarkable Highlights" notes in Zotero.
+
+    Works from Zotero alone, so it covers documents no longer on the tablet. Each note
+    is updated in place; only the text inside its highlight blocks changes.
+    """
+    from remarkable2zotero import pdf, zotero_client
+
+    try:
+        config = load_config(ctx.obj["config_path"])
+    except ConfigError as e:
+        log.error(str(e))
+        raise SystemExit(1)
+
+    cache_dir = get_cache_dir(config)
+    zot_cfg = config["zotero"]
+    zot = zotero_client.create_client(zot_cfg["api_key"], int(zot_cfg["group_id"]))
+
+    notes = zotero_client.list_highlights_notes(zot)
+    log.info("Found %d reMarkable Highlights note(s).", len(notes))
+    results = {"updated": 0, "unchanged": 0, "failed": 0}
+
+    for note in notes:
+        data = note["data"]
+        name = zotero_client.note_document_name(data["note"])
+        click.echo(f"\n{name.strip() or data['key']}")
+
+        highlights = zotero_client.parse_highlights_note(data["note"])
+        if not highlights:
+            click.echo("  No highlights to repair")
+            results["unchanged"] += 1
+            continue
+
+        # The tablet's own copy (in the sync cache) has matching page numbers; a Zotero
+        # attachment may not, so it is searched on every page
+        source = _cached_source(cache_dir, name)
+        any_page = source is None
+        if source is None:
+            source = zotero_client.download_attachment(
+                zot, data.get("parentItem", ""), cache_dir / "zotero"
+            )
+        if source is None:
+            log.error("  No cached copy or Zotero attachment to repair from")
+            results["failed"] += 1
+            continue
+
+        before = [h.text for h in highlights]
+        try:
+            restored = pdf.restore_highlight_text(source, highlights, any_page=any_page)
+        except Exception as e:
+            log.error("  Could not read %s: %s", source, e)
+            results["failed"] += 1
+            continue
+
+        changed = [(b, h.text) for b, h in zip(before, highlights) if b.strip() != h.text.strip()]
+        click.echo(
+            f"  {len(changed)} of {len(highlights)} highlight(s) changed, "
+            f"{len(highlights) - restored} not matched in {source.name}"
+        )
+        if not changed:
+            results["unchanged"] += 1
+            continue
+
+        if dry_run:
+            for old, new in changed[:2]:
+                click.echo(f"    - {old.strip()[:100]}")
+                click.echo(f"    + {new.strip()[:100]}")
+            continue
+
+        new_html = zotero_client.replace_note_highlights(data["note"], highlights)
+        if zotero_client.update_note(zot, note, new_html):
+            results["updated"] += 1
+        else:
+            results["failed"] += 1
+
+    if not dry_run:
+        click.echo(f"\nDone: {results['updated']} updated, {results['unchanged']} unchanged, "
+                   f"{results['failed']} failed")
+
+
+def _cached_source(cache_dir: Path, name: str) -> Path | None:
+    """The tablet's copy of a document in the sync cache, by its visible name."""
+    candidates = [
+        p for stem in dict.fromkeys((name, name.strip())) for ext in ("pdf", "epub")
+        for p in cache_dir.glob(f"*/{glob.escape(stem)}.{ext}")
+    ]
+    return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None

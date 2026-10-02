@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import difflib
 import logging
-import re
+from itertools import pairwise
 from pathlib import Path
 
-import fitz  # pymupdf
+import pymupdf as fitz
 
 from remarkable2zotero.models import Highlight, PositionedHighlight
 
@@ -59,35 +59,37 @@ def embed_highlights(
     return positioned
 
 
-def restore_highlight_text(source_path: Path, highlights: list[Highlight]) -> int:
-    """Replace each highlight's text with the matching words from the document.
+def restore_highlight_text(
+    source_path: Path, highlights: list[Highlight], any_page: bool = False
+) -> int:
+    """Restore the spaces the tablet dropped from each highlight, using the document.
 
-    The tablet stores highlight text with no space at line breaks. The words are
-    taken from the PDF instead, as the whole run between the first and last matched
-    word, so words the tablet dropped are restored too. Highlights that cannot be
-    matched keep the tablet's text. Returns the number restored.
+    The tablet stores highlight text with no space at line breaks. Each highlight is
+    matched against its page, which decides where the spaces go (see _respace); words
+    the tablet dropped are restored too. Highlights that cannot be matched keep the
+    tablet's text. Returns the number restored.
+
+    With any_page, a highlight not found on its own page is searched for on every
+    page, for a PDF whose pages may not line up with the tablet's copy.
     """
     doc, is_epub = _open_as_pdf(source_path)
     words_cache: dict[int, list] = {}
     restored = 0
     try:
         for h in highlights:
-            if is_epub:
+            own_page = [h.page_index] if h.page_index < len(doc) else []
+            if is_epub or any_page:
                 # Page indices don't correspond between the tablet and the converted PDF
-                page_numbers = range(len(doc))
-            elif h.page_index < len(doc):
-                page_numbers = [h.page_index]
+                page_numbers = own_page + [n for n in range(len(doc)) if n not in own_page]
             else:
-                page_numbers = []
+                page_numbers = own_page
 
             text = None
             for n in page_numbers:
                 if n not in words_cache:
                     words_cache[n] = doc[n].get_text("words")
-                page_words = words_cache[n]
-                span = _match_word_span(page_words, h.text)
-                if span:
-                    text = _join_words(page_words[span[0] : span[1] + 1])
+                text = _respace(h.text, words_cache[n])
+                if text:
                     break
 
             if text:
@@ -182,22 +184,40 @@ def _match_words_on_page(
 
 
 def _match_word_span(page_words: list, text: str) -> tuple[int, int] | None:
-    """Find the run of page words that a highlight covers.
+    """Find the run of page words that a highlight covers."""
+    alignment = _align(page_words, text)
+    if alignment is None:
+        return None
+    blocks, owner, _ = alignment
 
-    The reMarkable drops the space at every line break ('yethistoriography'), so
-    matching is done on the text with all non-word characters removed. Words the
-    tablet dropped or misread show up as gaps in the alignment; at least 40% of the
-    highlight's characters must align with the page.
+    # Extend past unaligned characters at either end of the highlight
+    first, last = blocks[0], blocks[-1]
+    target_len = len(alignment[2])
+    start_char = max(0, first.a - first.b)
+    end_char = min(len(owner), last.a + last.size + target_len - (last.b + last.size)) - 1
+    return owner[start_char], owner[end_char]
+
+
+def _align(page_words: list, text: str) -> tuple[list, list[int], list[int]] | None:
+    """Align a highlight's characters with the page's.
+
+    The reMarkable drops the space at every line break ('yethistoriography'), so both
+    sides are compared as word characters only, lowercased, with spaces and
+    punctuation removed. Words the tablet dropped or misread show up as gaps; at least
+    40% of the highlight's characters must align with the page.
+
+    Returns the aligned blocks (a = page character, b = highlight character), the page
+    word each page character came from, and the position in `text` of each highlight
+    character; or None if the highlight is not on the page.
     """
-    target = _match_key(text)
+    target, target_pos = _key_chars(text)
     if not target or not page_words:
         return None
 
-    # Concatenated page text, with the index of the word each character came from
     chars: list[str] = []
     owner: list[int] = []
     for i, w in enumerate(page_words):
-        key = _match_key(w[4])
+        key, _ = _key_chars(w[4])
         chars.append(key)
         owner.extend([i] * len(key))
     haystack = "".join(chars)
@@ -206,7 +226,7 @@ def _match_word_span(page_words: list, text: str) -> tuple[int, int] | None:
 
     pos = haystack.find(target)
     if pos >= 0:
-        return owner[pos], owner[pos + len(target) - 1]
+        return [difflib.Match(pos, 0, len(target))], owner, target_pos
 
     # Cheap rejection before the alignment: one end of the highlight must be on the page
     anchor = min(len(target), 12)
@@ -218,41 +238,76 @@ def _match_word_span(page_words: list, text: str) -> tuple[int, int] | None:
     blocks = [b for b in matcher.get_matching_blocks() if b.size >= min_block]
     if not blocks or sum(b.size for b in blocks) < len(target) * 0.4:
         return None
-
-    # Extend past unaligned characters at either end of the highlight
-    first, last = blocks[0], blocks[-1]
-    start_char = max(0, first.a - first.b)
-    end_char = min(len(haystack), last.a + last.size + len(target) - (last.b + last.size)) - 1
-    return owner[start_char], owner[end_char]
+    return blocks, owner, target_pos
 
 
-def _match_key(text: str) -> str:
-    return re.sub(r"[\W_]+", "", _normalize_for_matching(text)).lower()
+def _key_chars(text: str) -> tuple[str, list[int]]:
+    """The word characters of `text`, lowercased, and the position of each in `text`."""
+    key: list[str] = []
+    pos: list[int] = []
+    for i, ch in enumerate(text):
+        if ch.isalnum():
+            lower = ch.lower()
+            key.append(lower if len(lower) == 1 else ch)
+            pos.append(i)
+    return "".join(key), pos
 
 
-def _normalize_for_matching(text: str) -> str:
-    """Normalize text for word matching — handle curly quotes, etc."""
-    text = text.replace("\u2018", "'").replace("\u2019", "'")
-    text = text.replace("\u201c", '"').replace("\u201d", '"')
-    return text
+def _respace(text: str, page_words: list) -> str | None:
+    """Put back the spaces the tablet dropped at line breaks, using the page's words.
 
+    The tablet's characters are kept as they are; the page only decides where spaces
+    go. A space is added wherever the page has a word break and the highlight has no
+    whitespace, except at a word hyphenated across a line break. Whole words the page
+    has and the highlight skips over (the tablet dropped them) are added too.
+    Returns None if the highlight is not on the page.
+    """
+    alignment = _align(page_words, text)
+    if alignment is None:
+        return None
+    blocks, owner, target_pos = alignment
+    inserts: list[tuple[int, str]] = []
 
-def _join_words(page_words: list) -> str:
-    """Join page words with spaces, healing words hyphenated across a line break."""
-    parts: list[str] = []
-    for i, w in enumerate(page_words):
-        word = w[4]
-        nxt = page_words[i + 1] if i + 1 < len(page_words) else None
-        line_end = nxt is not None and (w[5], w[6]) != (nxt[5], nxt[6])
-        if (
-            line_end
-            and re.search(r"\w-$", word)
-            and nxt[4][:1].islower()
-        ):
-            parts.append(word[:-1])
-        else:
-            parts.append(word + " ")
-    return "".join(parts).strip()
+    def boundary(pa: int, pb: int, ta: int, tb: int, words: str = "") -> None:
+        """Page characters pa, pb and highlight characters ta, tb are adjacent."""
+        wa, wb = page_words[owner[pa]], page_words[owner[pb]]
+        if not words and owner[pa] == owner[pb]:
+            return
+        gap = text[target_pos[ta] + 1 : target_pos[tb]]
+        if not words:
+            if any(c.isspace() for c in gap):
+                return
+            line_break = (wa[5], wa[6]) != (wb[5], wb[6])
+            if line_break and wa[4].rstrip().endswith(("-", "\u00ad")):
+                return
+        # Opening punctuation of the next page word ('(', '"') goes after the space
+        lead = len(wb[4]) - len(wb[4].lstrip("\"'(\u2018\u201c[\u00ad"))
+        at = target_pos[tb] - min(lead, len(gap))
+        inserts.append((at, f" {words} " if words else " "))
+
+    for blk in blocks:
+        for k in range(blk.size - 1):
+            boundary(blk.a + k, blk.a + k + 1, blk.b + k, blk.b + k + 1)
+
+    for prev, nxt in pairwise(blocks):
+        pa, pb = prev.a + prev.size - 1, nxt.a
+        ta, tb = prev.b + prev.size - 1, nxt.b
+        if tb != ta + 1:
+            continue
+        if pb == pa + 1:
+            boundary(pa, pb, ta, tb)
+            continue
+        # Page characters with no counterpart in the highlight: words the tablet dropped.
+        # Only whole words, and not bare numbers (footnote markers, line numbers)
+        if owner[pa] == owner[pa + 1] or owner[pb] == owner[pb - 1]:
+            continue
+        dropped = [page_words[i][4] for i in range(owner[pa] + 1, owner[pb])]
+        if 0 < len(dropped) <= 8 and any(c.isalpha() for w in dropped for c in w):
+            boundary(pa, pb, ta, tb, " ".join(dropped))
+
+    for at, insert in sorted(inserts, reverse=True):
+        text = text[:at] + insert + text[at:]
+    return " ".join(text.split())
 
 
 def _apply_highlight(

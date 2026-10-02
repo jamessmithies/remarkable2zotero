@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import logging
 import re
@@ -275,6 +276,96 @@ def create_highlights_note(
     except zotero_errors.PyZoteroError as e:
         log.error("Failed to create note: %s", e)
         return False
+
+
+_NOTE_PART_RE = re.compile(
+    r"<h3>Page (\d+)</h3>|(<blockquote>\s*<p>)(.*?)(</p>\s*</blockquote>)", re.DOTALL
+)
+
+
+def list_highlights_notes(zot: zotero.Zotero) -> list[dict]:
+    notes = zot.everything(
+        zot.items(itemType="note", q="reMarkable Highlights", qmode="everything")
+    )
+    return [n for n in notes if "reMarkable Highlights" in n.get("data", {}).get("note", "")]
+
+
+def note_document_name(note_html: str) -> str:
+    m = re.search(r"<em>(.*?)</em>", note_html, re.DOTALL)
+    return html.unescape(m.group(1)) if m else ""
+
+
+def parse_highlights_note(note_html: str) -> list[Highlight]:
+    """Read the highlights back out of a "reMarkable Highlights" note.
+
+    Highlights whose text contains markup (edited in Zotero) are left out, so they are
+    never rewritten.
+    """
+    highlights = []
+    page = 1
+    for m in _NOTE_PART_RE.finditer(note_html):
+        if m.group(1):
+            page = int(m.group(1))
+        elif "<" not in m.group(3):
+            highlights.append(Highlight(
+                page_index=page - 1, text=html.unescape(m.group(3)), color=(0, 0, 0, 0), rects=[]
+            ))
+    return highlights
+
+
+def replace_note_highlights(note_html: str, highlights: list[Highlight]) -> str:
+    """Write highlight texts back into the note, changing nothing outside the blockquotes.
+
+    `highlights` must be the list parse_highlights_note returned, in the same order.
+    """
+    remaining = iter(highlights)
+
+    def substitute(m: re.Match) -> str:
+        if m.group(1) or "<" in m.group(3):
+            return m.group(0)
+        text = next(remaining).text.strip()
+        if text == html.unescape(m.group(3)).strip():
+            return m.group(0)
+        return m.group(2) + html.escape(text, quote=False) + m.group(4)
+
+    return _NOTE_PART_RE.sub(substitute, note_html)
+
+
+def update_note(zot: zotero.Zotero, note: dict, note_html: str) -> bool:
+    data = dict(note["data"])
+    data["note"] = note_html
+    try:
+        zot.update_item(data)
+        return True
+    except zotero_errors.PyZoteroError as e:
+        log.error("Failed to update note %s: %s", data.get("key"), e)
+        _handle_http_error(e)
+        return False
+
+
+def download_attachment(zot: zotero.Zotero, parent_key: str, dest_dir: Path) -> Path | None:
+    """Download the parent's PDF (or else EPUB) attachment. Returns the local path."""
+    try:
+        children = zot.children(parent_key)
+    except zotero_errors.PyZoteroError as e:
+        log.error("Failed to list attachments of %s: %s", parent_key, e)
+        return None
+
+    for content_type, ext in (("application/pdf", "pdf"), ("application/epub+zip", "epub")):
+        for child in children:
+            data = child.get("data", {})
+            if data.get("itemType") != "attachment" or data.get("contentType") != content_type:
+                continue
+            try:
+                content = zot.file(data["key"])
+            except zotero_errors.PyZoteroError as e:
+                log.warning("Failed to download attachment %s: %s", data["key"], e)
+                continue
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            path = dest_dir / f"{data['key']}.{ext}"
+            path.write_bytes(content)
+            return path
+    return None
 
 
 def create_new_item(
