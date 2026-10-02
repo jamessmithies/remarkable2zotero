@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 from pathlib import Path
@@ -17,16 +18,7 @@ def embed_highlights(
     output_path: Path,
 ) -> list[PositionedHighlight]:
     """Embed highlights into a PDF and return positioned highlights with PDF coordinates."""
-    source_doc = fitz.open(source_path)
-    is_epub = not source_doc.is_pdf
-
-    if is_epub:
-        log.info("Converting %s to PDF", source_path.suffix.lstrip(".").upper())
-        pdf_bytes = source_doc.convert_to_pdf()
-        source_doc.close()
-        doc = fitz.open("pdf", pdf_bytes)
-    else:
-        doc = source_doc
+    doc, is_epub = _open_as_pdf(source_path)
 
     positioned: list[PositionedHighlight] = []
     failed = 0
@@ -67,6 +59,65 @@ def embed_highlights(
     return positioned
 
 
+def restore_highlight_text(source_path: Path, highlights: list[Highlight]) -> int:
+    """Replace each highlight's text with the matching words from the document.
+
+    The tablet stores highlight text with no space at line breaks. The words are
+    taken from the PDF instead, as the whole run between the first and last matched
+    word, so words the tablet dropped are restored too. Highlights that cannot be
+    matched keep the tablet's text. Returns the number restored.
+    """
+    doc, is_epub = _open_as_pdf(source_path)
+    words_cache: dict[int, list] = {}
+    restored = 0
+    try:
+        for h in highlights:
+            if is_epub:
+                # Page indices don't correspond between the tablet and the converted PDF
+                page_numbers = range(len(doc))
+            elif h.page_index < len(doc):
+                page_numbers = [h.page_index]
+            else:
+                page_numbers = []
+
+            text = None
+            for n in page_numbers:
+                if n not in words_cache:
+                    words_cache[n] = doc[n].get_text("words")
+                page_words = words_cache[n]
+                span = _match_word_span(page_words, h.text)
+                if span:
+                    text = _join_words(page_words[span[0] : span[1] + 1])
+                    break
+
+            if text:
+                h.text = text
+                restored += 1
+            else:
+                log.warning(
+                    "Could not match highlight on page %d against the PDF, "
+                    "keeping the tablet's text: '%s'",
+                    h.page_index + 1, h.text.strip()[:60],
+                )
+    finally:
+        doc.close()
+
+    log.info("Restored text of %d/%d highlights from the PDF", restored, len(highlights))
+    return restored
+
+
+def _open_as_pdf(source_path: Path) -> tuple[fitz.Document, bool]:
+    """Open a PDF, or convert an EPUB to PDF. Returns the document and whether it was an EPUB."""
+    source_doc = fitz.open(source_path)
+    if source_doc.is_pdf:
+        return source_doc, False
+
+    log.info("Converting %s to PDF", source_path.suffix.lstrip(".").upper())
+    pdf_bytes = source_doc.convert_to_pdf()
+    source_doc.close()
+    return fitz.open("pdf", pdf_bytes), True
+
+
 def _add_highlight_search_all_pages(
     doc: fitz.Document, highlight: Highlight
 ) -> PositionedHighlight | None:
@@ -83,7 +134,7 @@ def _add_highlight_search_all_pages(
 
     # Long text or full search failed — use word-matching approach
     for page in doc:
-        rects = _match_words_on_page(page, text)
+        rects, _ = _match_words_on_page(page, text)
         if rects:
             return _apply_highlight_from_rects(page, rects, highlight)
 
@@ -105,7 +156,7 @@ def _add_highlight_to_page(
             return _apply_highlight(page, quads, highlight)
 
     # Long text or full search failed — use word-matching approach
-    rects = _match_words_on_page(page, text)
+    rects, _ = _match_words_on_page(page, text)
     if rects:
         return _apply_highlight_from_rects(page, rects, highlight)
 
@@ -113,64 +164,70 @@ def _add_highlight_to_page(
     return None
 
 
-def _match_words_on_page(page: fitz.Page, text: str) -> list[fitz.Rect]:
-    """Match highlight text against page words in sequence, collecting bounding rects.
+def _match_words_on_page(
+    page: fitz.Page, text: str
+) -> tuple[list[fitz.Rect], tuple[int, int] | None]:
+    """Match highlight text against the page's words.
 
-    Handles the reMarkable's line-break concatenation issue (e.g. 'yethistoriography')
-    by doing flexible word matching.
+    Returns the rects of the matched words and the (start, end) indices of the
+    matched run in page.get_text("words"), or ([], None) if there is no match.
     """
-    # Get all words from the page with positions: (x0, y0, x1, y1, "word", block, line, word_n)
     page_words = page.get_text("words")
-    if not page_words:
-        return []
+    span = _match_word_span(page_words, text)
+    if span is None:
+        return [], None
+    start, end = span
+    rects = [fitz.Rect(w[:4]) for w in page_words[start : end + 1]]
+    return rects, span
 
-    # Normalize the highlight text into words (split concatenated words too)
-    highlight_text = _normalize_for_matching(text)
-    h_words = highlight_text.lower().split()
-    if not h_words:
-        return []
 
-    # Build page word list with positions
-    pw_texts = [w[4].lower().strip() for w in page_words]
-    pw_rects = [fitz.Rect(w[0], w[1], w[2], w[3]) for w in page_words]
+def _match_word_span(page_words: list, text: str) -> tuple[int, int] | None:
+    """Find the run of page words that a highlight covers.
 
-    # Find the best starting position by sliding through page words
-    best_start = -1
-    best_count = 0
+    The reMarkable drops the space at every line break ('yethistoriography'), so
+    matching is done on the text with all non-word characters removed. Words the
+    tablet dropped or misread show up as gaps in the alignment; at least 40% of the
+    highlight's characters must align with the page.
+    """
+    target = _match_key(text)
+    if not target or not page_words:
+        return None
 
-    for start_idx in range(len(pw_texts)):
-        if not pw_texts[start_idx]:
-            continue
-        # Check if highlight words match starting from this position
-        count = _count_matching_words(h_words, pw_texts, start_idx)
-        if count > best_count:
-            best_count = count
-            best_start = start_idx
+    # Concatenated page text, with the index of the word each character came from
+    chars: list[str] = []
+    owner: list[int] = []
+    for i, w in enumerate(page_words):
+        key = _match_key(w[4])
+        chars.append(key)
+        owner.extend([i] * len(key))
+    haystack = "".join(chars)
+    if not haystack:
+        return None
 
-    # Require at least 40% of highlight words to match
-    if best_count < max(2, len(h_words) * 0.4):
-        return []
+    pos = haystack.find(target)
+    if pos >= 0:
+        return owner[pos], owner[pos + len(target) - 1]
 
-    # Collect rects for matched page words
-    matched_rects = []
-    h_idx = 0
-    p_idx = best_start
-    while h_idx < len(h_words) and p_idx < len(pw_texts):
-        if _words_similar(h_words[h_idx], pw_texts[p_idx]):
-            matched_rects.append(pw_rects[p_idx])
-            h_idx += 1
-            p_idx += 1
-        elif _word_starts_with(pw_texts[p_idx], h_words, h_idx):
-            # Page word contains multiple highlight words concatenated
-            matched_rects.append(pw_rects[p_idx])
-            consumed = _count_consumed_words(pw_texts[p_idx], h_words, h_idx)
-            h_idx += consumed
-            p_idx += 1
-        else:
-            # Skip this highlight word (might be part of concatenation)
-            h_idx += 1
+    # Cheap rejection before the alignment: one end of the highlight must be on the page
+    anchor = min(len(target), 12)
+    if target[:anchor] not in haystack and target[-anchor:] not in haystack:
+        return None
 
-    return matched_rects
+    matcher = difflib.SequenceMatcher(None, haystack, target, autojunk=False)
+    min_block = min(len(target), 8)
+    blocks = [b for b in matcher.get_matching_blocks() if b.size >= min_block]
+    if not blocks or sum(b.size for b in blocks) < len(target) * 0.4:
+        return None
+
+    # Extend past unaligned characters at either end of the highlight
+    first, last = blocks[0], blocks[-1]
+    start_char = max(0, first.a - first.b)
+    end_char = min(len(haystack), last.a + last.size + len(target) - (last.b + last.size)) - 1
+    return owner[start_char], owner[end_char]
+
+
+def _match_key(text: str) -> str:
+    return re.sub(r"[\W_]+", "", _normalize_for_matching(text)).lower()
 
 
 def _normalize_for_matching(text: str) -> str:
@@ -180,62 +237,22 @@ def _normalize_for_matching(text: str) -> str:
     return text
 
 
-def _count_matching_words(h_words: list[str], pw_texts: list[str], start: int) -> int:
-    """Count how many highlight words match page words starting at the given position."""
-    count = 0
-    h_idx = 0
-    p_idx = start
-
-    while h_idx < len(h_words) and p_idx < len(pw_texts):
-        if _words_similar(h_words[h_idx], pw_texts[p_idx]):
-            count += 1
-            h_idx += 1
-            p_idx += 1
-        elif _word_starts_with(pw_texts[p_idx], h_words, h_idx):
-            count += 1
-            consumed = _count_consumed_words(pw_texts[p_idx], h_words, h_idx)
-            h_idx += consumed
-            p_idx += 1
+def _join_words(page_words: list) -> str:
+    """Join page words with spaces, healing words hyphenated across a line break."""
+    parts: list[str] = []
+    for i, w in enumerate(page_words):
+        word = w[4]
+        nxt = page_words[i + 1] if i + 1 < len(page_words) else None
+        line_end = nxt is not None and (w[5], w[6]) != (nxt[5], nxt[6])
+        if (
+            line_end
+            and re.search(r"\w-$", word)
+            and nxt[4][:1].islower()
+        ):
+            parts.append(word[:-1])
         else:
-            h_idx += 1
-            # Allow small gaps
-            if h_idx - count > 3:
-                break
-
-    return count
-
-
-def _words_similar(a: str, b: str) -> bool:
-    """Check if two words are similar enough to count as a match."""
-    a = re.sub(r"[^\w]", "", a)
-    b = re.sub(r"[^\w]", "", b)
-    if not a or not b:
-        return False
-    return a == b or a.startswith(b) or b.startswith(a)
-
-
-def _word_starts_with(page_word: str, h_words: list[str], h_idx: int) -> bool:
-    """Check if a page word is a concatenation starting with h_words[h_idx]."""
-    pw = re.sub(r"[^\w]", "", page_word)
-    hw = re.sub(r"[^\w]", "", h_words[h_idx])
-    return len(pw) > len(hw) and pw.startswith(hw)
-
-
-def _count_consumed_words(page_word: str, h_words: list[str], h_idx: int) -> int:
-    """Count how many highlight words are consumed by a single concatenated page word."""
-    pw = re.sub(r"[^\w]", "", page_word)
-    consumed = 0
-    pos = 0
-    for i in range(h_idx, len(h_words)):
-        hw = re.sub(r"[^\w]", "", h_words[i])
-        if pw[pos:].startswith(hw):
-            pos += len(hw)
-            consumed += 1
-            if pos >= len(pw):
-                break
-        else:
-            break
-    return max(consumed, 1)
+            parts.append(word + " ")
+    return "".join(parts).strip()
 
 
 def _apply_highlight(

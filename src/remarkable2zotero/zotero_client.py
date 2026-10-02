@@ -149,19 +149,6 @@ def _author_matches(author: str | None, creators: list[dict]) -> bool:
     return False
 
 
-def _find_pdf_attachment(zot: zotero.Zotero, parent_key: str) -> dict | None:
-    try:
-        children = zot.children(parent_key)
-    except zotero_errors.PyZoteroError:
-        return None
-
-    for child in children:
-        data = child.get("data", {})
-        if data.get("itemType") == "attachment" and data.get("contentType") == "application/pdf":
-            return child
-    return None
-
-
 def _build_match(zot: zotero.Zotero, parent_key: str, attachment_item: dict) -> ZoteroMatch:
     try:
         parent = zot.item(parent_key)
@@ -176,47 +163,6 @@ def _build_match(zot: zotero.Zotero, parent_key: str, attachment_item: dict) -> 
         attachment_filename=attachment_item["data"].get("filename", ""),
         collections=parent_data.get("collections", []),
     )
-
-
-def upload_annotated_pdf(
-    zot: zotero.Zotero,
-    match: ZoteroMatch,
-    pdf_path: Path,
-) -> str | None:
-    """Replace the attachment and return the new attachment key, or None on failure."""
-    log.info(
-        "Updating '%s' — replacing attachment %s",
-        match.parent_title,
-        match.attachment_key,
-    )
-
-    # Delete old attachment (also removes any existing Zotero annotations on it)
-    try:
-        old_item = zot.item(match.attachment_key)
-        zot.delete_item(old_item)
-        log.debug("Deleted old attachment %s", match.attachment_key)
-    except zotero_errors.PyZoteroError as e:
-        log.error("Failed to delete old attachment: %s", e)
-        return None
-
-    # Upload new attachment as child of the same parent
-    try:
-        zot.attachment_simple([str(pdf_path)], parentid=match.parent_item_key)
-        log.info("Uploaded %s to Zotero", pdf_path.name)
-    except zotero_errors.PyZoteroError as e:
-        log.error("Failed to upload new attachment: %s", e)
-        _handle_http_error(e)
-        return None
-
-    # Find the new attachment key
-    new_attachment = _find_pdf_attachment(zot, match.parent_item_key)
-    if new_attachment:
-        new_key = new_attachment["data"]["key"]
-        log.debug("New attachment key: %s", new_key)
-        return new_key
-
-    log.warning("Could not find new attachment after upload")
-    return None
 
 
 def create_annotations(
@@ -286,7 +232,8 @@ def create_highlights_note(
     if not highlights:
         return False
 
-    # Delete any existing "reMarkable Highlights" note to avoid duplicates
+    # Replace any existing "reMarkable Highlights" note. If it can't be deleted, don't
+    # create another: the item would carry two copies of every passage
     try:
         children = zot.children(parent_key)
         for child in children:
@@ -295,8 +242,10 @@ def create_highlights_note(
                     and "reMarkable Highlights" in data.get("note", "")):
                 zot.delete_item(child)
                 log.debug("Deleted existing reMarkable highlights note")
-    except zotero_errors.PyZoteroError:
-        pass
+    except zotero_errors.PyZoteroError as e:
+        log.error("Failed to delete existing highlights note, not creating a new one: %s", e)
+        _handle_http_error(e)
+        return False
 
     # Build HTML note content
     lines = ["<h2>reMarkable Highlights</h2>"]

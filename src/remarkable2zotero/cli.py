@@ -167,7 +167,7 @@ def extract(ctx, document, output_dir):
 @click.pass_context
 def sync(ctx, document, dry_run, no_interact, force_create):
     """Full pipeline: extract annotations from reMarkable and push to Zotero."""
-    from remarkable2zotero import annotations, remarkable, zotero_client
+    from remarkable2zotero import annotations, pdf, remarkable, zotero_client
 
     try:
         config = load_config(ctx.obj["config_path"])
@@ -223,6 +223,16 @@ def sync(ctx, document, dry_run, no_interact, force_create):
 
             click.echo(f"  {len(highlights)} highlight(s) found")
 
+            # The tablet's text has no spaces at line breaks; take the words from the PDF
+            try:
+                restored = pdf.restore_highlight_text(doc.local_pdf_path, highlights)
+            except Exception as e:
+                log.warning("  Could not read %s: %s", doc.local_pdf_path, e)
+                restored = 0
+            if restored < len(highlights):
+                click.echo(f"  {len(highlights) - restored} highlight(s) not matched in the "
+                           f"PDF, kept the tablet's text")
+
             # Find match in Zotero
             match = zotero_client.find_matching_item(zot, doc, strategy=match_strategy)
 
@@ -236,11 +246,13 @@ def sync(ctx, document, dry_run, no_interact, force_create):
 
             if match:
                 click.echo(f"  Found in Zotero: '{match.parent_title}' ({match.parent_item_key})")
-                zotero_client.create_highlights_note(
+                if zotero_client.create_highlights_note(
                     zot, match.parent_item_key, highlights, doc.visible_name
-                )
-                click.echo(f"  Highlights note created ({len(highlights)} excerpts)")
-                results["updated"] += 1
+                ):
+                    click.echo(f"  Highlights note created ({len(highlights)} excerpts)")
+                    results["updated"] += 1
+                else:
+                    results["failed"] += 1
             else:
                 # No match found — prompt to create or skip
                 create = force_create
@@ -252,10 +264,9 @@ def sync(ctx, document, dry_run, no_interact, force_create):
 
                 if create:
                     item_key = zotero_client.create_new_item(zot, doc, doc.local_pdf_path)
-                    if item_key:
-                        zotero_client.create_highlights_note(
-                            zot, item_key, highlights, doc.visible_name
-                        )
+                    if item_key and zotero_client.create_highlights_note(
+                        zot, item_key, highlights, doc.visible_name
+                    ):
                         click.echo(
                             f"  Created in library root with highlights note "
                             f"({len(highlights)} excerpts) — file manually into a collection"
