@@ -4,7 +4,7 @@ PIP := $(VENV)/bin/pip
 CLI := $(VENV)/bin/remarkable2zotero
 ARGS ?=
 
-.PHONY: setup list extract sync test lint clean
+.PHONY: setup list extract sync export test lint clean
 
 setup: $(VENV)/bin/activate
 
@@ -22,6 +22,9 @@ extract: $(VENV)/bin/activate
 
 sync: $(VENV)/bin/activate
 	$(CLI) sync $(ARGS)
+
+export: $(VENV)/bin/activate
+	$(CLI) sync --tagged $(ARGS)
 
 test: $(VENV)/bin/activate
 	$(PYTHON) -m pytest tests/ $(ARGS)

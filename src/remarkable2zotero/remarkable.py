@@ -97,12 +97,16 @@ def _parse_document(
     if not rm_files:
         return None
 
+    # Document-level tags set on the tablet; page tags are ignored
+    tags = [t["name"] for t in content.get("tags") or [] if isinstance(t, dict) and t.get("name")]
+
     return RemarkableDocument(
         uuid=uuid,
         visible_name=metadata.get("visibleName", uuid),
         file_type=file_type,
         last_modified=metadata.get("lastModified", 0),
         page_uuids=page_uuids,
+        tags=tags,
     )
 
 

@@ -10,3 +10,4 @@ zotero:
 sync:
   local_cache_dir: "~/.cache/remarkable2zotero/"
   match_strategy: "filename"   # "filename" or "title"
+  export_tag: "export"         # tablet tag marking documents ready to sync

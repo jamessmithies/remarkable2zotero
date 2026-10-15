@@ -68,3 +68,11 @@ def get_cache_dir(config: dict) -> Path:
     ).expanduser()
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
+
+
+def get_export_tag(config: dict) -> str:
+    return str(config.get("sync", {}).get("export_tag", "export"))
+
+
+def has_tag(doc, tag: str) -> bool:
+    return any(t.lower() == tag.lower() for t in doc.tags)

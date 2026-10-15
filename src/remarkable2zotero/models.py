@@ -19,6 +19,7 @@ class RemarkableDocument:
     file_type: str
     last_modified: int
     page_uuids: list[str]
+    tags: list[str] = field(default_factory=list)
     local_pdf_path: Path | None = None
     local_rm_dir: Path | None = None
 

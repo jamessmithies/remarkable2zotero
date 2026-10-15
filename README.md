@@ -58,10 +58,13 @@ zotero:
 
 ```bash
 make sync                      # interactive: choose which documents to sync
+make export                    # sync only documents tagged "export" on the tablet
+make export ARGS="--dry-run"   # preview the tagged documents
 make sync ARGS="--dry-run"     # preview without uploading
 make sync ARGS="-d 'Paper'"   # process a single document by name
 make sync ARGS="--no-interact" # process all without prompting
 make list                      # list annotated documents on the device
+make list ARGS="--tagged"      # list only documents tagged "export"
 make extract                   # extract locally annotated PDFs (no Zotero)
 ```
 
@@ -77,6 +80,10 @@ Notes created before line-break repair was added have glued words. `repair-notes
 It finds every "reMarkable Highlights" note in the group and matches each highlight against the tablet's copy of the document in the sync cache, which has the same page numbers. If there's no cached copy, it downloads the item's PDF (or epub) from Zotero and searches every page, since that copy may be paginated differently. Notes are updated in place: only the text inside each highlight block changes, so the note keeps its key and anything else in it, and a highlight you've reformatted in Zotero is left alone.
 
 Running `make sync` presents a numbered list of annotated documents and prompts you to select which to process (e.g. `1,3` or `2-4` or `a` for all).
+
+### Export tag
+
+Tag a document `export` on the tablet (document tags, not page tags) to mark it ready for syncing. `make list` and the `make sync` picker highlight tagged documents, and the picker offers `e` to select them (the default when any are tagged). `make export` syncs only tagged documents, still asking which to process; add `ARGS="--no-interact"` to take them all. The tag match is case-insensitive and exact, so `export-ready` doesn't count. Use a different tag by setting `sync.export_tag` in the config. The tool never changes tags on the tablet, so remove the tag (or the document) yourself once it's synced.
 
 ## How matching works
 

@@ -7,29 +7,45 @@ from pathlib import Path
 
 import click
 
-from remarkable2zotero.config import ConfigError, get_cache_dir, load_config
+from remarkable2zotero.config import (
+    ConfigError,
+    get_cache_dir,
+    get_export_tag,
+    has_tag,
+    load_config,
+)
 
 log = logging.getLogger("remarkable2zotero")
 
 
-def _prompt_select_documents(docs: list) -> list:
+def _prompt_select_documents(docs: list, export_tag: str) -> list:
     """Prompt the user to select which documents to process."""
     if not docs:
         return []
 
+    tagged = [d for d in docs if has_tag(d, export_tag)]
+
     click.echo("\nAnnotated documents on device:\n")
     for i, doc in enumerate(docs, 1):
-        click.echo(f"  {i}. {doc.visible_name} ({doc.file_type})")
+        line = f"  {i}. {doc.visible_name} ({doc.file_type})"
+        if has_tag(doc, export_tag):
+            line = click.style(f"{line}  [{export_tag}]", fg="green", bold=True)
+        click.echo(line)
 
     click.echo("\n  a. All")
+    if tagged:
+        click.echo(f"  e. Tagged '{export_tag}' ({len(tagged)})")
     selection = click.prompt(
-        "\nSelect documents to sync (e.g. 1,3 or 2-4 or a for all)",
-        default="a",
+        "\nSelect documents to sync (e.g. 1,3 or 2-4 or a for all"
+        + (", e for tagged)" if tagged else ")"),
+        default="e" if tagged else "a",
     )
 
     selection = selection.strip().lower()
     if selection == "a":
         return docs
+    if selection == "e":
+        return tagged
 
     selected = set()
     for part in selection.split(","):
@@ -76,8 +92,9 @@ def main(ctx, config, verbose):
 
 
 @main.command()
+@click.option("--tagged", is_flag=True, help="Only documents with the export tag")
 @click.pass_context
-def list(ctx):
+def list(ctx, tagged):
     """List annotated PDFs on the reMarkable."""
     from remarkable2zotero import remarkable
 
@@ -101,14 +118,27 @@ def list(ctx):
         sftp.close()
         client.close()
 
+    export_tag = get_export_tag(config)
+    if tagged:
+        docs = [d for d in docs if has_tag(d, export_tag)]
+
     if not docs:
-        click.echo("No annotated PDFs found on device.")
+        if tagged:
+            click.echo(f"No annotated PDFs tagged '{export_tag}' found on device.")
+        else:
+            click.echo("No annotated PDFs found on device.")
         return
 
     click.echo(f"{'Name':<50} {'Pages':>5}  {'UUID'}")
     click.echo("-" * 90)
     for doc in docs:
-        click.echo(f"{doc.visible_name:<50} {len(doc.page_uuids):>5}  {doc.uuid}")
+        line = f"{doc.visible_name:<50} {len(doc.page_uuids):>5}  {doc.uuid}"
+        if has_tag(doc, export_tag):
+            line = click.style(f"{line}  [{export_tag}]", fg="green", bold=True)
+        click.echo(line)
+
+    n_tagged = sum(has_tag(d, export_tag) for d in docs)
+    click.echo(f"\n{len(docs)} document(s), {n_tagged} tagged '{export_tag}'")
 
 
 @main.command()
@@ -165,8 +195,9 @@ def extract(ctx, document, output_dir):
 @click.option("--dry-run", is_flag=True, help="Show what would be done without uploading")
 @click.option("--no-interact", is_flag=True, help="Skip ambiguous matches instead of prompting")
 @click.option("--force-create", is_flag=True, help="Create new Zotero items if no match found")
+@click.option("--tagged", is_flag=True, help="Only documents with the export tag")
 @click.pass_context
-def sync(ctx, document, dry_run, no_interact, force_create):
+def sync(ctx, document, dry_run, no_interact, force_create, tagged):
     """Full pipeline: extract annotations from reMarkable and push to Zotero."""
     from remarkable2zotero import annotations, pdf, remarkable, zotero_client
 
@@ -190,13 +221,19 @@ def sync(ctx, document, dry_run, no_interact, force_create):
     sftp = client.open_sftp()
     try:
         docs = remarkable.discover_documents(sftp)
+        export_tag = get_export_tag(config)
+        if tagged:
+            docs = [d for d in docs if has_tag(d, export_tag)]
+            if not docs:
+                click.echo(f"No annotated documents tagged '{export_tag}' on device.")
+                return
         if document:
             docs = [d for d in docs if d.visible_name.lower() == document.lower()]
             if not docs:
                 log.error("Document '%s' not found on device.", document)
                 raise SystemExit(1)
         elif not no_interact:
-            docs = _prompt_select_documents(docs)
+            docs = _prompt_select_documents(docs, export_tag)
             if not docs:
                 click.echo("No documents selected.")
                 return
