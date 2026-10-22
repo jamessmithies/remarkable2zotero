@@ -113,3 +113,34 @@ def test_respace_puts_opening_punctuation_after_the_space():
 def test_respace_skips_soft_hyphen_line_breaks():
     words = _words("the predetermi­", "nations of")
     assert pdf._respace("the predeterminations of", words) == "the predeterminations of"
+
+
+def _placed(*lines):
+    """Page words in get_text("words") form with positions, one line per argument.
+
+    Each word gets a line number of its own, as PyMuPDF does for the fragments of
+    kerned words in old TeX PDFs."""
+    words = []
+    for n, line in enumerate(lines):
+        x = 0
+        for word in line.split():
+            words.append((x, 14 * n, x + 5 * len(word), 14 * n + 10, word, 0, len(words), 0))
+            x += 5 * len(word) + 3
+    return words
+
+
+def test_respace_ignores_word_breaks_within_lines_of_fragmented_pdfs():
+    words = _placed("Biologists ha v e long sough t concepts to describ e the", "w a ys in")
+    assert pdf._respace("Biologists have long sought concepts to describe theways in", words) == (
+        "Biologists have long sought concepts to describe the ways in"
+    )
+
+
+def test_respace_ignores_fragments_in_short_highlights():
+    words = _placed("Sp atial p artition.")
+    assert pdf._respace("Spatial partition.", words) == "Spatial partition."
+
+
+def test_respace_keeps_hyphen_split_from_its_word():
+    words = _placed("are sp eci -", "cally adapted")
+    assert pdf._respace("are speci-cally adapted", words) == "are speci-cally adapted"

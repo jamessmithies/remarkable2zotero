@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pymupdf as fitz
 
+from remarkable2zotero import tex
 from remarkable2zotero.models import Highlight, PositionedHighlight
 
 log = logging.getLogger(__name__)
@@ -217,7 +218,7 @@ def _align(page_words: list, text: str) -> tuple[list, list[int], list[int]] | N
     chars: list[str] = []
     owner: list[int] = []
     for i, w in enumerate(page_words):
-        key, _ = _key_chars(w[4])
+        key, _ = _key_chars(w[4].translate(tex.LIGATURES))
         chars.append(key)
         owner.extend([i] * len(key))
     haystack = "".join(chars)
@@ -258,7 +259,10 @@ def _respace(text: str, page_words: list) -> str | None:
 
     The tablet's characters are kept as they are; the page only decides where spaces
     go. A space is added wherever the page has a word break and the highlight has no
-    whitespace, except at a word hyphenated across a line break. Whole words the page
+    whitespace, except at a word hyphenated across a line break. Some PDFs (old TeX
+    output) split words wherever letters are kerned ('agen', 'vironmen', 't'); when
+    many word breaks within a line are missing from the highlight, the page's words
+    can't be trusted there and only line breaks get a space. Whole words the page
     has and the highlight skips over (the tablet dropped them) are added too.
     Returns None if the highlight is not on the page.
     """
@@ -267,6 +271,7 @@ def _respace(text: str, page_words: list) -> str | None:
         return None
     blocks, owner, target_pos = alignment
     inserts: list[tuple[int, str]] = []
+    mid_line: list[tuple[int, str]] = []
 
     def boundary(pa: int, pb: int, ta: int, tb: int, words: str = "") -> None:
         """Page characters pa, pb and highlight characters ta, tb are adjacent."""
@@ -277,13 +282,16 @@ def _respace(text: str, page_words: list) -> str | None:
         if not words:
             if any(c.isspace() for c in gap):
                 return
-            line_break = (wa[5], wa[6]) != (wb[5], wb[6])
-            if line_break and wa[4].rstrip().endswith(("-", "\u00ad")):
+            same_line = _same_line(wa, wb)
+            hyphens = ("-", "\u00ad")
+            if not same_line and (wa[4].rstrip().endswith(hyphens) or gap.endswith(hyphens)):
                 return
+        else:
+            same_line = False
         # Opening punctuation of the next page word ('(', '"') goes after the space
         lead = len(wb[4]) - len(wb[4].lstrip("\"'(\u2018\u201c[\u00ad"))
         at = target_pos[tb] - min(lead, len(gap))
-        inserts.append((at, f" {words} " if words else " "))
+        (mid_line if same_line else inserts).append((at, f" {words} " if words else " "))
 
     for blk in blocks:
         for k in range(blk.size - 1):
@@ -305,9 +313,28 @@ def _respace(text: str, page_words: list) -> str | None:
         if 0 < len(dropped) <= 8 and any(c.isalpha() for w in dropped for c in w):
             boundary(pa, pb, ta, tb, " ".join(dropped))
 
+    if len(mid_line) <= 0.15 * len(text.split()):
+        inserts += mid_line
     for at, insert in sorted(inserts, reverse=True):
         text = text[:at] + insert + text[at:]
     return " ".join(text.split())
+
+
+def _same_line(wa: tuple, wb: tuple) -> bool:
+    """Whether page word wb follows wa on the same printed line.
+
+    PyMuPDF's line numbers can't be relied on (it may number each fragment of a
+    kerned word as a line of its own), so the words' positions decide: wb overlaps
+    wa's height by more than half and doesn't wrap back to the left. Words with no
+    size fall back to the line numbers.
+    """
+    if (wa[5], wa[6]) == (wb[5], wb[6]):
+        return True
+    height = min(wa[3] - wa[1], wb[3] - wb[1])
+    if height <= 0:
+        return False
+    overlap = min(wa[3], wb[3]) - max(wa[1], wb[1])
+    return overlap > height / 2 and wb[0] >= wa[0]
 
 
 def _apply_highlight(

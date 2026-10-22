@@ -5,6 +5,7 @@ from pathlib import Path
 
 import rmscene
 
+from remarkable2zotero import tex
 from remarkable2zotero.models import Highlight, Rect, RemarkableDocument
 
 log = logging.getLogger(__name__)
@@ -32,6 +33,10 @@ def extract_highlights(doc: RemarkableDocument) -> list[Highlight]:
             highlights.extend(page_highlights)
         except Exception as e:
             log.warning("Failed to parse %s (page %d): %s", rm_path.name, page_index, e)
+
+    tex_encoded = tex.is_tex_encoded([h.text for h in highlights])
+    for h in highlights:
+        h.text = tex.decode(h.text, tex_encoded)
 
     highlights.sort(key=lambda h: (h.page_index, h.rects[0].y if h.rects else 0))
     log.info("Extracted %d highlights from %s", len(highlights), doc.visible_name)
